@@ -32,6 +32,12 @@ import {
 
 import { computeSimpleDiff } from '../services/aiService';
 
+import {
+  normalizeImportedHtml,
+  resolveIframeRenderPlan,
+  stripEditorChrome,
+} from '../utils/editor';
+
 // ─────────────────────────────────────────────
 // TEST FIXTURES
 // ─────────────────────────────────────────────
@@ -675,5 +681,141 @@ describe('Integration: full edit workflow', () => {
     // Redo once
     state = editorReducer(state, actions.redo());
     expect(state.html).toContain('New');
+  });
+});
+
+// ─────────────────────────────────────────────
+// IFRAME RENDER PLAN (edit-mode consistency)
+// ─────────────────────────────────────────────
+
+describe('resolveIframeRenderPlan', () => {
+  test('skips when iframe is not mounted (code mode)', () => {
+    expect(
+      resolveIframeRenderPlan({
+        editType: 'full',
+        htmlChanged: true,
+        iframeRemounted: false,
+        mode: 'code',
+        hasIframe: false,
+      })
+    ).toBe('skip');
+  });
+
+  test('selection-only updates decorate instead of full reload', () => {
+    // This is the core inconsistency fix: clicking/selecting must not rewrite
+    // the iframe, or double-click contenteditable is destroyed mid-session.
+    expect(
+      resolveIframeRenderPlan({
+        editType: 'full',
+        htmlChanged: false,
+        iframeRemounted: false,
+        mode: 'visual',
+        hasIframe: true,
+      })
+    ).toBe('decorate');
+  });
+
+  test('preview mode strips editor chrome without rewriting HTML', () => {
+    expect(
+      resolveIframeRenderPlan({
+        editType: 'full',
+        htmlChanged: false,
+        iframeRemounted: false,
+        mode: 'preview',
+        hasIframe: true,
+      })
+    ).toBe('undecorate');
+  });
+
+  test('incremental edits decorate without full reload', () => {
+    expect(
+      resolveIframeRenderPlan({
+        editType: 'incremental',
+        htmlChanged: true,
+        iframeRemounted: false,
+        mode: 'visual',
+        hasIframe: true,
+      })
+    ).toBe('decorate');
+  });
+
+  test('real HTML changes force a full rewrite', () => {
+    expect(
+      resolveIframeRenderPlan({
+        editType: 'full',
+        htmlChanged: true,
+        iframeRemounted: false,
+        mode: 'visual',
+        hasIframe: true,
+      })
+    ).toBe('full');
+  });
+
+  test('iframe remount after leaving code mode forces a full rewrite', () => {
+    expect(
+      resolveIframeRenderPlan({
+        editType: 'full',
+        htmlChanged: false,
+        iframeRemounted: true,
+        mode: 'visual',
+        hasIframe: true,
+      })
+    ).toBe('full');
+  });
+
+  test('incremental + remount still rewrites (DOM was destroyed)', () => {
+    expect(
+      resolveIframeRenderPlan({
+        editType: 'incremental',
+        htmlChanged: true,
+        iframeRemounted: true,
+        mode: 'visual',
+        hasIframe: true,
+      })
+    ).toBe('full');
+  });
+});
+
+describe('stripEditorChrome', () => {
+  test('removes editor attributes, handlers, and stylesheet', () => {
+    const doc = document.implementation.createHTMLDocument('t');
+    doc.body.innerHTML = `
+      <section data-section="hero">
+        <h1 data-hc-path="0" data-hc-section="hero" data-hc-selected="true" contenteditable="true">Hi</h1>
+      </section>
+    `;
+    const style = doc.createElement('style');
+    style.id = '__hc_editor__';
+    doc.head.appendChild(style);
+    const h1 = doc.querySelector('h1');
+    h1.onclick = () => {};
+    h1.ondblclick = () => {};
+    doc.body.onclick = () => {};
+
+    stripEditorChrome(doc);
+
+    expect(h1.hasAttribute('data-hc-path')).toBe(false);
+    expect(h1.hasAttribute('contenteditable')).toBe(false);
+    expect(h1.hasAttribute('data-hc-selected')).toBe(false);
+    expect(h1.onclick).toBeNull();
+    expect(h1.ondblclick).toBeNull();
+    expect(doc.body.onclick).toBeNull();
+    expect(doc.getElementById('__hc_editor__')).toBeNull();
+    // Source content preserved
+    expect(doc.querySelector('[data-section="hero"] h1').textContent).toBe('Hi');
+  });
+});
+
+describe('normalizeImportedHtml', () => {
+  test('injects data-section when missing', () => {
+    const html = '<!DOCTYPE html><html><body><div class="hero"><h1>X</h1></div></body></html>';
+    const next = normalizeImportedHtml(html);
+    expect(next).toContain('data-section=');
+    expect(next).toContain('<!DOCTYPE html>');
+  });
+
+  test('leaves already-tagged HTML untouched', () => {
+    const html = '<html><body><section data-section="a">A</section></body></html>';
+    expect(normalizeImportedHtml(html)).toBe(html);
   });
 });
