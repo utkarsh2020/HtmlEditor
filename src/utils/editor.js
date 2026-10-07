@@ -9,7 +9,67 @@
  *  - Auto-normalization of imported HTML (injecting data-section attributes)
  *  - Reading computed/inline styles from live elements (for the style panel)
  *  - Clean serialization that strips editor metadata
+ *  - Deciding when the iframe must be rewritten vs. merely re-decorated
  */
+
+export const EDITOR_ATTRS = [
+  'data-hc-path',
+  'data-hc-section',
+  'data-hc-label',
+  'data-hc-section-active',
+  'data-hc-selected',
+  'contenteditable',
+];
+
+/**
+ * Decide how the canvas iframe should update for this React effect cycle.
+ *
+ * Selection / path / mode-only updates must NOT rewrite the iframe — that was
+ * wiping contenteditable mid-edit and making Visual mode feel inconsistent.
+ *
+ * @returns {'full' | 'decorate' | 'undecorate' | 'skip'}
+ */
+export function resolveIframeRenderPlan({
+  editType,
+  htmlChanged,
+  iframeRemounted,
+  mode,
+  hasIframe,
+}) {
+  if (!hasIframe) return 'skip';
+
+  // Live DOM already has the latest content (style/text apply, inline commit).
+  if (editType === 'incremental' && !iframeRemounted) {
+    return mode === 'visual' ? 'decorate' : 'undecorate';
+  }
+
+  // Real HTML change, or iframe was remounted (e.g. leaving Code mode).
+  if (htmlChanged || iframeRemounted) return 'full';
+
+  // Same document instance + same HTML: selection or mode chrome only.
+  return mode === 'visual' ? 'decorate' : 'undecorate';
+}
+
+/**
+ * Remove editor-injected attributes, handlers, and the editor stylesheet
+ * from a live (or cloned) document without rewriting its HTML content.
+ */
+export function stripEditorChrome(doc) {
+  if (!doc) return;
+
+  doc.querySelectorAll('[data-hc-path], [contenteditable]').forEach((el) => {
+    EDITOR_ATTRS.forEach((attr) => el.removeAttribute(attr));
+    el.onclick = null;
+    el.ondblclick = null;
+    el.onblur = null;
+    el.onkeydown = null;
+  });
+
+  const editorStyle = doc.getElementById('__hc_editor__');
+  if (editorStyle) editorStyle.remove();
+
+  if (doc.body) doc.body.onclick = null;
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -292,21 +352,8 @@ export function serializeFromIframe(iframeRef, originalHtml = '') {
   try {
     const clone = doc.cloneNode(true);
 
-    // Strip editor marker attributes
-    clone.querySelectorAll('[data-hc-path],[contenteditable]').forEach((el) => {
-      [
-        'data-hc-path',
-        'data-hc-section',
-        'data-hc-label',
-        'data-hc-section-active',
-        'data-hc-selected',
-        'contenteditable',
-      ].forEach((attr) => el.removeAttribute(attr));
-    });
-
-    // Remove editor-injected style tag (but keep __hc_theme__ if user applied a theme)
-    const editorStyle = clone.getElementById('__hc_editor__');
-    if (editorStyle) editorStyle.remove();
+    // Strip editor marker attributes / chrome before export
+    stripEditorChrome(clone);
 
     const hasDoctype = /<!doctype\s+html/i.test(originalHtml);
     return (hasDoctype ? '<!DOCTYPE html>\n' : '') + clone.documentElement.outerHTML;

@@ -8,8 +8,10 @@ import {
   getElementComputedProps,
   isPlainColor,
   normalizeImportedHtml,
+  resolveIframeRenderPlan,
   rgbToHex,
   serializeFromIframe,
+  stripEditorChrome,
 } from './utils/editor';
 import {
   appendToBody,
@@ -140,8 +142,17 @@ export default function App() {
    * editTypeRef controls the iframe rendering strategy in the main effect:
    *   'full'        → rewrite iframe entirely (import, undo/redo, AI apply)
    *   'incremental' → DOM was already mutated; just re-decorate, skip reload
+   *
+   * Selection / path / mode-only updates leave editType as the default 'full'
+   * but resolveIframeRenderPlan still chooses decorate/undecorate when the HTML
+   * string and iframe instance are unchanged — avoiding the reload that used
+   * to kill contenteditable mid-edit.
    */
   const editTypeRef = useRef('full');
+  const lastWrittenHtmlRef = useRef('');
+  const writtenIframeRef = useRef(null);
+  const inlineEditingRef = useRef(false);
+  const decorateTimerRef = useRef(null);
 
   // ---------------------------------------------------------------------------
   // Notifications
@@ -247,6 +258,7 @@ export default function App() {
 
   const commitInlineText = useCallback(() => {
     editTypeRef.current = 'incremental';
+    inlineEditingRef.current = false;
     const newHtml = serializeFromIframe(iframeRef, state.html);
     if (newHtml !== state.html) {
       setHtml(newHtml, 'Inline text edit');
@@ -259,12 +271,26 @@ export default function App() {
 
   useEffect(() => {
     const iframe = iframeRef.current;
-    if (!iframe) return;
-    const doc = iframe.contentDocument || iframe.contentWindow?.document;
-    if (!doc) return;
-
-    const isIncremental = editTypeRef.current === 'incremental';
+    const doc = iframe?.contentDocument || iframe?.contentWindow?.document || null;
+    const editType = editTypeRef.current;
     editTypeRef.current = 'full'; // reset for next cycle
+
+    const htmlChanged = state.html !== lastWrittenHtmlRef.current;
+    const iframeRemounted = !!iframe && writtenIframeRef.current !== iframe;
+    const plan = resolveIframeRenderPlan({
+      editType,
+      htmlChanged,
+      iframeRemounted,
+      mode: state.mode,
+      hasIframe: !!iframe && !!doc,
+    });
+
+    if (decorateTimerRef.current) {
+      window.clearTimeout(decorateTimerRef.current);
+      decorateTimerRef.current = null;
+    }
+
+    if (plan === 'skip') return undefined;
 
     // ── decorate ────────────────────────────────────────────────────────────
     // Inject editor styles + event handlers into the iframe without rewriting it.
@@ -319,6 +345,9 @@ export default function App() {
             }
             if (path === null) return;
 
+            const isActivelyEditing =
+              inlineEditingRef.current && node.getAttribute('contenteditable') === 'true';
+
             node.setAttribute('data-hc-path', path);
             node.setAttribute('data-hc-section', sectionId);
             node.setAttribute('data-hc-label', `${node.tagName.toLowerCase()}`);
@@ -327,6 +356,10 @@ export default function App() {
               'data-hc-selected',
               sectionId === state.selectedSection && path === (selectedPath || 'root') ? 'true' : 'false'
             );
+
+            // Keep an in-progress contenteditable session intact — rebinding
+            // dblclick/blur here was a source of dropped keystrokes / lost focus.
+            if (isActivelyEditing) return;
 
             // ── Click: select ────────────────────────────────────────────
             node.onclick = (e) => {
@@ -343,7 +376,17 @@ export default function App() {
               e.stopPropagation();
               selectCanvasNode(sectionId, path);
 
+              // End any other inline edit first (one active editor at a time)
+              iDoc.querySelectorAll('[contenteditable="true"]').forEach((other) => {
+                if (other !== node) {
+                  other.removeAttribute('contenteditable');
+                  other.onblur = null;
+                  other.onkeydown = null;
+                }
+              });
+
               const originalHtml = node.innerHTML;
+              inlineEditingRef.current = true;
               node.setAttribute('contenteditable', 'true');
               node.focus();
 
@@ -360,6 +403,7 @@ export default function App() {
               const cleanup = (commit) => {
                 if (committed) return;
                 committed = true;
+                inlineEditingRef.current = false;
                 node.removeAttribute('contenteditable');
                 node.onblur = null;
                 node.onkeydown = null;
@@ -374,8 +418,15 @@ export default function App() {
 
               node.onblur = () => cleanup(true);
               node.onkeydown = (ke) => {
-                if (ke.key === 'Enter' && !ke.shiftKey) { ke.preventDefault(); cleanup(true); }
-                if (ke.key === 'Escape') { ke.preventDefault(); cleanup(false); }
+                if (ke.key === 'Enter' && !ke.shiftKey) {
+                  ke.preventDefault();
+                  node.blur(); // blur → cleanup(true) via onblur
+                }
+                if (ke.key === 'Escape') {
+                  ke.preventDefault();
+                  cleanup(false);
+                  node.blur(); // onblur is already cleared; just drop focus
+                }
               };
             };
           });
@@ -389,29 +440,50 @@ export default function App() {
           }
         };
 
-        // Update editable nodes from live DOM
-        if (state.selectedSection) {
-          setEditableNodes(getEditableDescriptors(iframeRef, state.selectedSection));
-        } else {
-          setEditableNodes([]);
+        // Update editable nodes from live DOM (skip while typing to avoid
+        // draft textarea resets mid-keystroke from descriptor refreshes)
+        if (!inlineEditingRef.current) {
+          if (state.selectedSection) {
+            setEditableNodes(getEditableDescriptors(iframeRef, state.selectedSection));
+          } else {
+            setEditableNodes([]);
+          }
         }
       } catch (_) {
         // Silently ignore decoration failures on malformed HTML
       }
     };
 
-    // ── Full reload vs incremental ─────────────────────────────────────────
-    if (isIncremental) {
-      // DOM was already mutated directly — just re-run decoration to refresh
-      // selection indicators and rebuild the editable node list.
-      decorate();
-    } else {
-      // Full reload: rewrite iframe content, then decorate after render.
+    // ── Apply render plan ──────────────────────────────────────────────────
+    if (plan === 'full') {
+      // Abort any in-flight inline edit — the document is about to be replaced.
+      inlineEditingRef.current = false;
       doc.open();
       doc.write(state.html);
       doc.close();
-      window.setTimeout(decorate, 60);
+      lastWrittenHtmlRef.current = state.html;
+      writtenIframeRef.current = iframe;
+      decorateTimerRef.current = window.setTimeout(() => {
+        decorateTimerRef.current = null;
+        if (state.mode === 'visual') decorate();
+      }, 60);
+    } else if (plan === 'decorate') {
+      // Keep lastWrittenHtml in sync after incremental commits
+      lastWrittenHtmlRef.current = state.html;
+      writtenIframeRef.current = iframe;
+      decorate();
+    } else if (plan === 'undecorate') {
+      lastWrittenHtmlRef.current = state.html;
+      writtenIframeRef.current = iframe;
+      stripEditorChrome(doc);
     }
+
+    return () => {
+      if (decorateTimerRef.current) {
+        window.clearTimeout(decorateTimerRef.current);
+        decorateTimerRef.current = null;
+      }
+    };
   }, [
     commitInlineText,
     notify,
